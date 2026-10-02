@@ -15,14 +15,16 @@ try:
 except Exception:
     Groq = None
 
-# Groq vision-capable model (reads bill images). Override with the GROQ_VISION_MODEL env var / Streamlit secret
-# if Groq renames or retires it (check console.groq.com/docs/models).
+# Groq vision-capable models (read bill images). Set GROQ_VISION_MODEL in Streamlit Secrets if Groq renames or
+# retires a model (check console.groq.com/docs/models). The fallback model is tried if the first one fails.
 VISION_MODEL = os.getenv('GROQ_VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')
+VISION_FALLBACK_MODELS = ['meta-llama/llama-4-maverick-17b-128e-instruct']
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png')
 TEXT_MODEL = os.getenv('GROQ_TEXT_MODEL', 'openai/gpt-oss-120b')  # text-only: used for the agents' reasoning/writing
 CREW_MODEL = f'groq/{TEXT_MODEL}'  # CrewAI (LiteLLM) format: groq/<groq model id>
 MAX_PDF_PAGES_FOR_VISION = 2
-MAX_IMAGE_SIDE = 1600
+MAX_IMAGE_SIDE = 2400  # keep enough resolution to read the small 12-month history table
+MAX_IMAGE_BYTES = 2_800_000  # Groq accepts up to ~4 MB of base64 per image
 
 VISION_PROMPT = (
     "This is a Pakistani electricity bill (DISCO such as PESCO, LESCO, IESCO, MEPCO, FESCO, K-Electric). "
@@ -64,14 +66,22 @@ def find_kwh(text):
     return None
 
 
+def _encode_jpeg(img):
+    """JPEG-encode, lowering quality if needed so the image stays under Groq's size limit."""
+    for quality in (85, 70, 55):
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=quality)
+        if buf.tell() <= MAX_IMAGE_BYTES:
+            break
+    return buf.getvalue()
+
+
 def prepare_image(data):
-    """Fix phone-photo rotation, shrink, and re-encode as JPEG so it fits Groq's request size limits."""
+    """Fix phone-photo rotation, shrink, and re-encode as JPEG."""
     img = Image.open(io.BytesIO(data))
     img = ImageOps.exif_transpose(img).convert('RGB')
     img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
-    buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=85)
-    return buf.getvalue()
+    return _encode_jpeg(img)
 
 
 def pdf_to_images(data, max_pages=MAX_PDF_PAGES_FOR_VISION):
@@ -80,10 +90,7 @@ def pdf_to_images(data, max_pages=MAX_PDF_PAGES_FOR_VISION):
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             for page in pdf.pages[:max_pages]:
-                pil = page.to_image(resolution=150).original
-                buf = io.BytesIO()
-                pil.convert('RGB').save(buf, format='JPEG', quality=85)
-                images.append(buf.getvalue())
+                images.append(_encode_jpeg(page.to_image(resolution=150).original.convert('RGB')))
     except Exception:
         pass
     return images
@@ -128,28 +135,40 @@ def parse_bill_json(raw):
     }
 
 
-def vision_extract(client, jpeg_bytes):
+def vision_extract(client, jpeg_bytes, errors):
+    """Ask the vision model(s) to read one bill image. Any problem is appended to `errors`."""
     b64 = base64.b64encode(jpeg_bytes).decode()
-    response = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': VISION_PROMPT},
-                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}},
-            ],
-        }],
-        temperature=0,
-        max_tokens=700,
-    )
-    return parse_bill_json(response.choices[0].message.content)
+    models = [VISION_MODEL] + [m for m in VISION_FALLBACK_MODELS if m != VISION_MODEL]
+    for model in models:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': VISION_PROMPT},
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}},
+                    ],
+                }],
+                temperature=0,
+                max_tokens=700,
+            )
+            raw = response.choices[0].message.content
+        except Exception as e:
+            errors.append(f'{model}: {str(e)[:300]}')
+            continue
+        r = parse_bill_json(raw)
+        if r and (r['units_kwh'] is not None or r['history']):
+            return r
+        errors.append(f'{model}: no units found in the reply: {(raw or "")[:200]}')
+    return None
 
 
-def read_bill_with_vision(client, images):
+def read_bill_with_vision(client, images, errors):
     """Read each image (page) and merge what was found."""
     merged = {'billing_month': None, 'units_kwh': None, 'history': [], 'city_text': None, 'disco': None}
     for img in images:
-        r = vision_extract(client, img)
+        r = vision_extract(client, img, errors)
         if not r:
             continue
         for k in ('billing_month', 'units_kwh', 'city_text', 'disco'):
@@ -172,11 +191,14 @@ def bill_agent(bills, api_key=''):
         data = f.getvalue()
         is_pdf = name.endswith('.pdf')
         rec = {'file': f.name, 'billing_month': None, 'kwh': None, 'history_months': 0, 'method': None}
+        errors = []
         parsed = None
         try:
             if client is not None and (is_pdf or name.endswith(IMAGE_EXTS)):
                 images = pdf_to_images(data) if is_pdf else [prepare_image(data)]
-                parsed = read_bill_with_vision(client, images)
+                if not images:
+                    errors.append('could not open the file as an image')
+                parsed = read_bill_with_vision(client, images, errors)
                 rec['method'] = 'vision'
             has_data = bool(parsed) and (parsed['units_kwh'] is not None or bool(parsed['history']))
             if is_pdf and not has_data:
@@ -185,7 +207,7 @@ def bill_agent(bills, api_key=''):
                     parsed = {'billing_month': None, 'units_kwh': kwh, 'history': [], 'city_text': None, 'disco': None}
                     rec['method'] = 'pdf_text'
         except Exception as e:
-            rec['error'] = str(e)
+            errors.append(str(e)[:300])
 
         has_data = bool(parsed) and (parsed['units_kwh'] is not None or bool(parsed['history']))
         if has_data:
@@ -195,8 +217,11 @@ def bill_agent(bills, api_key=''):
                 current_rows.append({'month': parsed['billing_month'] or f'unknown:{f.name}', 'units': parsed['units_kwh']})
             city_text = city_text or parsed['city_text']
             disco = disco or parsed['disco']
-        elif client is None:
-            skipped_no_key += 1
+        else:
+            if client is None:
+                skipped_no_key += 1
+            if errors:
+                rec['error'] = ' | '.join(errors)[:900]
         files.append(rec)
 
     stats = consumption_stats(history_rows + current_rows)  # current-bill values override history values
