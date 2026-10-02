@@ -3,6 +3,14 @@ import os
 import pandas as pd
 import streamlit as st
 
+# Copy secrets into environment variables BEFORE the crew module is imported (it reads the model names from them).
+for _key in ('GROQ_API_KEY', 'GROQ_VISION_MODEL', 'GROQ_TEXT_MODEL'):
+    try:
+        if _key in st.secrets:
+            os.environ[_key] = str(st.secrets[_key])
+    except Exception:
+        pass
+
 from crew.solar_crew import bill_agent, build_quote, run_solar_analysis
 from utils.calculations import CITY_LATITUDES, SEASONS, apply_new_loads, consumption_stats
 
@@ -50,6 +58,9 @@ if 'bill_data' in st.session_state:
         st.warning(f"Only {bd['files_read']} of {bd['files_uploaded']} files could be read. {bd['note']}")
     else:
         st.info(bd['note'])
+    for _f in bd['files']:
+        if _f.get('error'):
+            st.error(f"{_f['file']}: {_f['error']}")
     st.caption('Compare with the bill and fix any wrong value. You can add or delete rows (month format YYYY-MM).')
 
     df = pd.DataFrame(bd['monthly'], columns=['month', 'units'])
