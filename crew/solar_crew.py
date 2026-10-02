@@ -15,13 +15,28 @@ try:
 except Exception:
     Groq = None
 
-# Groq vision-capable models (read bill images). Set GROQ_VISION_MODEL in Streamlit Secrets if Groq renames or
-# retires a model (check console.groq.com/docs/models). The fallback model is tried if the first one fails.
-VISION_MODEL = os.getenv('GROQ_VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')
-VISION_FALLBACK_MODELS = ['meta-llama/llama-4-maverick-17b-128e-instruct']
-IMAGE_EXTS = ('.jpg', '.jpeg', '.png')
-TEXT_MODEL = os.getenv('GROQ_TEXT_MODEL', 'openai/gpt-oss-120b')  # text-only: used for the agents' reasoning/writing
-CREW_MODEL = f'groq/{TEXT_MODEL}'  # CrewAI (LiteLLM) format: groq/<groq model id>
+# ---------------------------------------------------------
+# GROQ MODELS
+# ---------------------------------------------------------
+
+# Current Groq multimodal/vision model.
+# Used for reading uploaded electricity-bill images.
+VISION_MODEL = os.getenv(
+    'GROQ_VISION_MODEL',
+    'qwen/qwen3.8-27b'
+)
+
+# No old Llama 4 fallback models.
+VISION_FALLBACK_MODELS = []
+
+# Text/reasoning model used by CrewAI.
+TEXT_MODEL = os.getenv(
+    'GROQ_TEXT_MODEL',
+    'openai/gpt-oss-120b'
+)
+
+# CrewAI / LiteLLM format
+CREW_MODEL = f'groq/{TEXT_MODEL}'
 MAX_PDF_PAGES_FOR_VISION = 2
 MAX_IMAGE_SIDE = 2400  # keep enough resolution to read the small 12-month history table
 MAX_IMAGE_BYTES = 2_800_000  # Groq accepts up to ~4 MB of base64 per image
