@@ -3,12 +3,12 @@ import io
 import json
 import os
 import re
-from statistics import mean
 
 import pdfplumber
 from PIL import Image, ImageOps
 
-from utils.calculations import size_solar_system
+from utils.calculations import (MONTH_RE, apply_new_loads, consumption_stats, detect_city,
+                                recommended_tilt, size_options)
 
 try:
     from groq import Groq
@@ -25,12 +25,16 @@ MAX_PDF_PAGES_FOR_VISION = 2
 MAX_IMAGE_SIDE = 1600
 
 VISION_PROMPT = (
-    "This is an electricity bill (for example from a DISCO such as PESCO, LESCO, IESCO or K-Electric). "
-    "Extract two values:\n"
-    "- billing_month: the billing month of THIS bill as YYYY-MM, or null if not visible.\n"
-    "- units_kwh: the units (kWh) consumed in THIS billing month. Do NOT return the amount in rupees, "
-    "the meter reading, or any value from the previous-months history table. Use null if not visible.\n"
-    'Respond with ONLY a JSON object, no other text: {"billing_month": "YYYY-MM" or null, "units_kwh": number or null}'
+    "This is a Pakistani electricity bill (DISCO such as PESCO, LESCO, IESCO, MEPCO, FESCO, K-Electric). "
+    "Return ONLY a JSON object, no other text, with these keys:\n"
+    '- "billing_month": month of THIS bill as YYYY-MM (for example "SEP 26" means "2026-09"), or null.\n'
+    '- "units_kwh": units consumed in THIS bill (the UNITS value in the meter info box), or null. '
+    "Never rupees and never meter readings.\n"
+    '- "history": the BILL HISTORY table (usually the 12 previous months). One item per row: '
+    '{"month": "YYYY-MM", "units": number}. A label like "Sep 25" means "2025-09". '
+    "Use ONLY the UNITS column, never the bill or payment columns. Use an empty list if there is no table.\n"
+    '- "city_text": the consumer\'s city or area as printed on the bill (no personal names), or null.\n'
+    '- "disco": the electricity company name or abbreviation, or null.'
 )
 
 
@@ -85,25 +89,43 @@ def pdf_to_images(data, max_pages=MAX_PDF_PAGES_FOR_VISION):
     return images
 
 
-def parse_vision_json(raw):
-    """Pull the JSON object out of the model reply and validate it."""
+def _valid_units(x):
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return x if 0 < x < 100000 else None  # implausible for a single monthly bill otherwise
+
+
+def _valid_month(m):
+    return m if isinstance(m, str) and MONTH_RE.fullmatch(m) else None
+
+
+def parse_bill_json(raw):
+    """Pull the JSON object out of the model reply and validate every field."""
     m = re.search(r'\{.*\}', raw or '', re.S)
     if not m:
-        return None, None
+        return None
     try:
         obj = json.loads(m.group(0))
     except Exception:
-        return None, None
-    units = obj.get('units_kwh')
-    try:
-        units = float(units)
-    except (TypeError, ValueError):
-        units = None
-    if units is not None and not (0 < units < 100000):
-        units = None  # implausible reading for a single monthly bill
-    month = obj.get('billing_month')
-    month = month if isinstance(month, str) and re.fullmatch(r'\d{4}-\d{2}', month) else None
-    return units, month
+        return None
+    if not isinstance(obj, dict):
+        return None
+    history = []
+    for item in obj.get('history') or []:
+        if isinstance(item, dict):
+            month, units = _valid_month(item.get('month')), _valid_units(item.get('units'))
+            if month and units is not None:
+                history.append({'month': month, 'units': units})
+    text = lambda v: v if isinstance(v, str) else None
+    return {
+        'billing_month': _valid_month(obj.get('billing_month')),
+        'units_kwh': _valid_units(obj.get('units_kwh')),
+        'history': history,
+        'city_text': text(obj.get('city_text')),
+        'disco': text(obj.get('disco')),
+    }
 
 
 def vision_extract(client, jpeg_bytes):
@@ -118,75 +140,104 @@ def vision_extract(client, jpeg_bytes):
             ],
         }],
         temperature=0,
-        max_tokens=200,
+        max_tokens=700,
     )
-    return parse_vision_json(response.choices[0].message.content)
+    return parse_bill_json(response.choices[0].message.content)
 
 
 def read_bill_with_vision(client, images):
-    """Try each image until one yields a units value."""
+    """Read each image (page) and merge what was found."""
+    merged = {'billing_month': None, 'units_kwh': None, 'history': [], 'city_text': None, 'disco': None}
     for img in images:
-        units, month = vision_extract(client, img)
-        if units is not None:
-            return units, month
-    return None, None
+        r = vision_extract(client, img)
+        if not r:
+            continue
+        for k in ('billing_month', 'units_kwh', 'city_text', 'disco'):
+            merged[k] = merged[k] or r[k]
+        merged['history'].extend(r['history'])
+        if merged['units_kwh'] is not None and merged['history']:
+            break
+    return merged
 
 
 def bill_agent(bills, api_key=''):
+    """Read every uploaded bill: this month's units + the 12-month history table + a city hint."""
     client = Groq(api_key=api_key) if (api_key and Groq is not None) else None
-    records = []
+    files, history_rows, current_rows = [], [], []
+    city_text = disco = None
     skipped_no_key = 0
 
     for f in bills:
         name = f.name.lower()
         data = f.getvalue()
-        rec = {'file': f.name, 'kwh': None, 'billing_month': None, 'method': None, 'text_found': False}
-
+        is_pdf = name.endswith('.pdf')
+        rec = {'file': f.name, 'billing_month': None, 'kwh': None, 'history_months': 0, 'method': None}
+        parsed = None
         try:
-            if name.endswith('.pdf'):
-                text = extract_pdf_text(f)
-                rec['text_found'] = bool(text.strip())
-                kwh = find_kwh(text)
+            if client is not None and (is_pdf or name.endswith(IMAGE_EXTS)):
+                images = pdf_to_images(data) if is_pdf else [prepare_image(data)]
+                parsed = read_bill_with_vision(client, images)
+                rec['method'] = 'vision'
+            has_data = bool(parsed) and (parsed['units_kwh'] is not None or bool(parsed['history']))
+            if is_pdf and not has_data:
+                kwh = find_kwh(extract_pdf_text(f))  # text-PDF fallback: current month only
                 if kwh is not None:
-                    rec.update(kwh=kwh, method='pdf_text')
-                elif client is not None:
-                    # Scanned PDF (no text layer) or regex miss -> read the rendered pages with vision
-                    kwh, month = read_bill_with_vision(client, pdf_to_images(data))
-                    if kwh is not None:
-                        rec.update(kwh=kwh, billing_month=month, method='vision_pdf')
-                else:
-                    skipped_no_key += 1
-            elif name.endswith(IMAGE_EXTS):
-                if client is None:
-                    skipped_no_key += 1
-                else:
-                    kwh, month = read_bill_with_vision(client, [prepare_image(data)])
-                    if kwh is not None:
-                        rec.update(kwh=kwh, billing_month=month, method='vision_image')
+                    parsed = {'billing_month': None, 'units_kwh': kwh, 'history': [], 'city_text': None, 'disco': None}
+                    rec['method'] = 'pdf_text'
         except Exception as e:
             rec['error'] = str(e)
 
-        records.append(rec)
+        has_data = bool(parsed) and (parsed['units_kwh'] is not None or bool(parsed['history']))
+        if has_data:
+            rec.update(billing_month=parsed['billing_month'], kwh=parsed['units_kwh'], history_months=len(parsed['history']))
+            history_rows += parsed['history']
+            if parsed['units_kwh'] is not None:
+                current_rows.append({'month': parsed['billing_month'] or f'unknown:{f.name}', 'units': parsed['units_kwh']})
+            city_text = city_text or parsed['city_text']
+            disco = disco or parsed['disco']
+        elif client is None:
+            skipped_no_key += 1
+        files.append(rec)
 
-    values = [x['kwh'] for x in records if x['kwh'] is not None]
+    stats = consumption_stats(history_rows + current_rows)  # current-bill values override history values
+    files_read = sum(1 for r in files if r['kwh'] is not None or r['history_months'])
     notes = []
     if skipped_no_key:
         notes.append(f'{skipped_no_key} bill(s) need the vision model but GROQ_API_KEY is missing.')
-    if len(values) < len(records):
-        notes.append('Some bills could not be read. Check values manually or upload a clearer copy.')
-    notes.append('Vision-extracted values are AI readings: verify them against the bills before quoting.')
+    if files_read < len(files):
+        notes.append('Some files could not be read. Add the months manually in the table below.')
+    if 0 < stats['months_used'] < 12:
+        notes.append(f"Only {stats['months_used']} month(s) found. Add the missing months for an accurate 12-month average.")
+    notes.append('Values read from photos are AI readings: compare them with the bill before continuing.')
 
     return {
-        'months_uploaded': len(records),
-        'months_extracted': len(values),
-        'monthly_records': records,
-        'average_monthly_kwh': mean(values) if values else 0,
-        'annual_kwh': sum(values) if values else 0,
+        'files': files,
+        'files_uploaded': len(files),
+        'files_read': files_read,
+        'monthly': stats['monthly'],
+        'city_hint': detect_city(city_text) or detect_city(disco),
         'note': ' '.join(notes),
     }
 
 
-def llm_agent_summary(api_key, consumption, sizing, panel_brand, inverter_brand):
+def _facts(base_stats, stats, sizing, orientation, loads, panel_brand, inverter_brand):
+    text = f'average monthly consumption from the bills {base_stats["average_monthly_kwh"]:.0f} kWh, '
+    if loads['loads']:
+        names = ', '.join(ld['name'] for ld in loads['loads'])
+        text += (
+            f'planned new loads ({names}) add about {loads["avg_added_kwh_month"]:.0f} kWh/month on average '
+            f'(connected load {loads["connected_kw"]} kW), giving {stats["average_monthly_kwh"]:.0f} kWh/month in total, '
+        )
+    text += (
+        f'highest month {stats["max_kwh"]:.0f} kWh ({stats["max_month"]}), lowest month {stats["min_kwh"]:.0f} kWh ({stats["min_month"]}), '
+        f'recommended plant {sizing["recommended_kw"]} kW with {sizing["panel_count"]} panels, '
+        f'site {orientation["city"]}, panels facing true South at about {orientation["tilt_deg"]} degrees tilt, '
+        f'panel {panel_brand}, inverter {inverter_brand}'
+    )
+    return text
+
+
+def llm_agent_summary(api_key, base_stats, stats, sizing, orientation, loads, panel_brand, inverter_brand):
     """Direct Groq SDK call (no CrewAI). Used as a fallback if CrewAI is unavailable."""
     if not api_key or Groq is None:
         return 'AI summary skipped: add GROQ_API_KEY in Streamlit Secrets.'
@@ -194,8 +245,8 @@ def llm_agent_summary(api_key, consumption, sizing, panel_brand, inverter_brand)
         client = Groq(api_key=api_key)
         prompt = (
             'You are a solar consultant. Write a concise customer-facing summary (under 150 words) using ONLY these '
-            f'verified numbers. Do not invent prices or engineering facts. Consumption: {consumption["average_monthly_kwh"]:.0f} kWh/month. '
-            f'Recommended plant: {sizing["recommended_kw"]} kW, {sizing["panel_count"]} panels. Panel: {panel_brand}. Inverter: {inverter_brand}.'
+            'verified numbers. Do not invent prices or engineering facts. '
+            + _facts(base_stats, stats, sizing, orientation, loads, panel_brand, inverter_brand)
         )
         chat_completion = client.chat.completions.create(
             messages=[{'role': 'user', 'content': prompt}],
@@ -206,7 +257,7 @@ def llm_agent_summary(api_key, consumption, sizing, panel_brand, inverter_brand)
         return f'AI summary unavailable: {e}'
 
 
-def run_crew_report(api_key, consumption, sizing, panel_brand, inverter_brand):
+def run_crew_report(api_key, base_stats, stats, sizing, options, basis, orientation, loads, panel_brand, inverter_brand):
     """CrewAI multi-agent report: bill auditor -> sizing reviewer -> consultant (customer summary)."""
     if not api_key:
         return 'AI report skipped: add GROQ_API_KEY in Streamlit Secrets.'
@@ -218,14 +269,14 @@ def run_crew_report(api_key, consumption, sizing, panel_brand, inverter_brand):
 
         auditor = Agent(
             role='Electricity Bill Auditor',
-            goal='Check extracted monthly kWh values for gaps, duplicates and outliers.',
+            goal='Check the monthly kWh history for gaps, duplicates, misreads and the seasonal pattern.',
             backstory='You review electricity bill data for a solar company and only report what the data shows.',
             llm=llm, allow_delegation=False, verbose=False,
         )
         reviewer = Agent(
             role='PV Sizing Reviewer',
-            goal='Sanity-check the calculated system size against the customer consumption. Never change the numbers.',
-            backstory='You are a solar design engineer who checks that panel count, plant size and expected generation are consistent.',
+            goal='Sanity-check the calculated system size against the customer consumption and planned new loads. Never change the numbers.',
+            backstory='You are a solar design engineer who checks that plant size, panel count and expected generation are consistent.',
             llm=llm, allow_delegation=False, verbose=False,
         )
         consultant = Agent(
@@ -237,18 +288,25 @@ def run_crew_report(api_key, consumption, sizing, panel_brand, inverter_brand):
 
         audit_task = Task(
             description=(
-                'Review these extracted bill records and list any data-quality problems '
-                '(missing months, duplicate months, values far from the rest, bills not read). '
-                f'Records: {json.dumps(consumption["monthly_records"])}'
+                'Review this monthly consumption (kWh) taken from the customer bill history. Flag data-quality problems '
+                '(missing months in the 12-month window, duplicates, implausible jumps that look like misreads) and '
+                'describe the seasonal pattern. '
+                f'Monthly data: {json.dumps(base_stats["monthly"])}. '
+                f'Maximum: {base_stats["max_kwh"]} kWh in {base_stats["max_month"]}. '
+                f'Minimum: {base_stats["min_kwh"]} kWh in {base_stats["min_month"]}.'
             ),
-            expected_output='A short bullet list of data-quality issues, or "No issues found".',
+            expected_output='A short bullet list of data-quality issues and the seasonal pattern.',
             agent=auditor,
         )
         review_task = Task(
             description=(
-                'Check that these calculated values are consistent with each other and with the consumption. '
-                'Do NOT recalculate or change them; only flag concerns. '
-                f'Average monthly consumption: {consumption["average_monthly_kwh"]:.0f} kWh. Sizing: {json.dumps(sizing)}.'
+                'Check that the sizing is consistent with the consumption and the planned new loads. Do NOT recalculate or change '
+                'numbers; only flag concerns (for example peak-month sizing oversizing the plant for most of the year, unrealistic '
+                'hours/day or season for a new load, or the inverter needing to carry the added connected load). '
+                f'Average monthly consumption from bills: {base_stats["average_monthly_kwh"]} kWh. '
+                f'Planned new loads: {json.dumps(loads)}. '
+                f'Average including new loads: {stats["average_monthly_kwh"]} kWh. '
+                f'Sizing options: {json.dumps(options)}. Chosen basis: {basis}. Orientation: {json.dumps(orientation)}.'
             ),
             expected_output='A short bullet list of concerns, or "Sizing looks consistent".',
             agent=reviewer,
@@ -257,10 +315,8 @@ def run_crew_report(api_key, consumption, sizing, panel_brand, inverter_brand):
         summary_task = Task(
             description=(
                 'Write a concise customer-facing summary (under 150 words). Use ONLY these numbers: '
-                f'average monthly consumption {consumption["average_monthly_kwh"]:.0f} kWh, '
-                f'recommended plant {sizing["recommended_kw"]} kW, {sizing["panel_count"]} panels, '
-                f'panel {panel_brand}, inverter {inverter_brand}. '
-                'Mention any data-quality issues or concerns from the audit and the sizing review. Do not state prices.'
+                + _facts(base_stats, stats, sizing, orientation, loads, panel_brand, inverter_brand)
+                + '. Mention any data-quality issues or concerns from the audit and the sizing review. Do not state prices.'
             ),
             expected_output='A plain-text summary for the customer.',
             agent=consultant,
@@ -273,18 +329,37 @@ def run_crew_report(api_key, consumption, sizing, panel_brand, inverter_brand):
         return getattr(result, 'raw', str(result))
     except Exception as e:
         # CrewAI missing or failed (e.g. dependency/build issue) -> fall back to a single direct Groq call
-        fallback = llm_agent_summary(api_key, consumption, sizing, panel_brand, inverter_brand)
+        fallback = llm_agent_summary(api_key, base_stats, stats, sizing, orientation, loads, panel_brand, inverter_brand)
         return f'{fallback}\n\n(CrewAI unavailable: {e})'
 
 
-def run_solar_analysis(bills, customer_name, panel_brand, panel_watt, inverter_brand, peak_sun_hours, losses, groq_api_key=''):
-    consumption = bill_agent(bills, groq_api_key)
-    sizing = size_solar_system(consumption['average_monthly_kwh'], peak_sun_hours, losses, panel_watt)
-    summary = run_crew_report(groq_api_key, consumption, sizing, panel_brand, inverter_brand)
+def run_solar_analysis(monthly, customer_name, city, latitude, panel_brand, panel_watt, inverter_brand,
+                       peak_sun_hours, losses, sizing_basis='average', new_loads=None, groq_api_key=''):
+    base_stats = consumption_stats(monthly)
+    adjusted, loads = apply_new_loads(monthly, new_loads)
+    stats = consumption_stats(adjusted)  # bills + planned new loads
+    base_options = size_options(base_stats, peak_sun_hours, losses, panel_watt)
+    options = size_options(stats, peak_sun_hours, losses, panel_watt)
+    sizing = options['peak' if sizing_basis == 'peak' else 'average']
+    orientation = {
+        'city': city,
+        'latitude': latitude,
+        'azimuth_deg': 180,
+        'tilt_deg': recommended_tilt(latitude, stats['summer_heavy']),
+        'summer_biased': stats['summer_heavy'],
+    }
+    summary = run_crew_report(groq_api_key, base_stats, stats, sizing, options, sizing_basis, orientation, loads,
+                              panel_brand, inverter_brand)
     return {
         'customer': {'name': customer_name},
-        'consumption': consumption,
+        'consumption': stats,
+        'base_consumption': base_stats,
+        'new_loads': loads,
         'sizing': sizing,
+        'sizing_options': options,
+        'base_sizing_options': base_options,
+        'sizing_basis': sizing_basis,
+        'orientation': orientation,
         'selection': {'panel_brand': panel_brand, 'panel_watt': panel_watt, 'inverter_brand': inverter_brand},
         'ai_summary': summary,
     }
