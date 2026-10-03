@@ -697,7 +697,7 @@ def run_crew_report(
             Task,
         )
 
-             llm = LLM(
+        llm = LLM(
             model=CREW_MODEL,
             api_key=api_key,
             temperature=0.1,
