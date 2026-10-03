@@ -37,7 +37,7 @@ VISION_FALLBACK_MODELS = []
 TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
 
 # CrewAI / LiteLLM format.
-CREW_MODEL = TEXT_MODEL
+CREW_MODEL = f"groq/{TEXT_MODEL}"
 
 
 # =========================================================
@@ -697,11 +697,9 @@ def run_crew_report(
             Task,
         )
 
-        llm = LLM(
+             llm = LLM(
             model=CREW_MODEL,
             api_key=api_key,
-            base_url="https://api.groq.com/openai/v1",
-            custom_openai=True,
             temperature=0.1,
             max_tokens=800,
         )
